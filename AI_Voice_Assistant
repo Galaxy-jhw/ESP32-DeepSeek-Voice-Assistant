@@ -6,50 +6,45 @@
 #include "Audio.h"
 #include "driver/i2s.h"
 
-// ===================== 1. Credentials Configuration =====================
-const char* ssid             = "YOUR_WIFI_SSID";         // Replace with your WiFi SSID
-const char* password         = "YOUR_WIFI_PASSWORD";     // Replace with your WiFi Password
+// ===================== 1. 专属配置区 =====================
+const char* ssid             = "";        
+const char* password         = "";        
 
-const char* baidu_api_key    = "YOUR_BAIDU_AK";          // Insert Baidu API Key (AK)
-const char* baidu_secret_key = "YOUR_BAIDU_SK";          // Insert Baidu Secret Key (SK)
+const char* baidu_api_key    = "";      
+const char* baidu_secret_key = "";   
+const char* deepseek_key     = "";
 
-const char* deepseek_key     = "sk-YOUR_DEEPSEEK_KEY";   // Insert DeepSeek Key (must include sk-)
+// ===================== 2. 终极避坑版硬件引脚 =====================
+#define I2S_SCK     11 
+#define I2S_WS      12
+#define I2S_SD      13  
 
-// ===================== 2. Hardware Pin Configuration =====================
-// Microphone (INMP441)
-#define I2S_SD      16  
-#define I2S_WS      15  
-#define I2S_SCK     14  
-
-// Speaker Amplifier (MAX98357A)
 #define SPK_BCLK    4   
 #define SPK_LRC     5   
 #define SPK_DOUT    6   
 
-// Button (Using the onboard BOOT button)
-#define BUTTON_PIN  0   
+#define BUTTON_PIN  10   
 
-// ===================== Global Variables =====================
+// ===================== 全局变量 =====================
 Audio audio;
 String baidu_token = "";
 char* record_buffer = NULL; 
 int record_size = 0;        
-const int MAX_RECORD_SIZE = 1024 * 600; // Max recording buffer (Approx. 15 seconds)
+int MAX_RECORD_SIZE = 1024 * 600; 
 bool is_recording = false;
 
-// ===================== Functional Modules =====================
+// ===================== 核心功能模块 =====================
 
-// 1. Initialize Microphone Recording
 void i2s_mic_init() {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 16000, 
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S, 
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
-    .dma_buf_len = 64,
+    .dma_buf_len = 256, 
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -60,211 +55,217 @@ void i2s_mic_init() {
     .data_out_num = -1,
     .data_in_num = I2S_SD
   };
+  
   i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_1, &pin_config);
 }
 
-// 2. Obtain Baidu Authentication Token
 void getBaiduToken() {
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure(); 
   HTTPClient http;
   String url = String("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=") + baidu_api_key + "&client_secret=" + baidu_secret_key;
-  http.begin(url);
+  
+  http.begin(secureClient, url); 
   int httpCode = http.GET();
   if (httpCode == 200) {
     String payload = http.getString();
-    JsonDocument doc;
+    DynamicJsonDocument doc(2048); 
     deserializeJson(doc, payload);
-    baidu_token = String((const char*)doc["access_token"]);
-    Serial.println("✅ Baidu Token obtained successfully!");
+    
+    baidu_token = doc["access_token"].as<String>();
+    if (baidu_token == "null") baidu_token = ""; 
+    
+    if (baidu_token != "") Serial.println("✅ 百度鉴权成功!");
   } else {
-    Serial.println("❌ Failed to obtain Baidu Token. Please check your AK and SK!");
+    Serial.println("❌ 百度鉴权失败, 网络错误!");
   }
   http.end();
 }
 
-// 3. Speech-to-Text (Upload audio to Baidu Cloud)
 String speechToText() {
   if (baidu_token == "") getBaiduToken();
-  if (record_size == 0) return "";
+  if (record_size == 0 || baidu_token == "") return "";
 
-  Serial.println("⏳ Uploading audio for Baidu STT recognition...");
+  Serial.printf("⏳ 准备上传 %d 字节语音...\n", record_size);
+  
   WiFiClientSecure client;
   client.setInsecure();
-  if (!client.connect("vop.baidu.com", 443)) return "";
-
-  String url = "/server_api?dev_pid=1537&cuid=ESP32&token=" + baidu_token;
-  client.println("POST " + url + " HTTP/1.1");
-  client.println("Host: vop.baidu.com");
-  client.println("Content-Type: audio/pcm;rate=16000");
-  client.print("Content-Length: ");
-  client.println(record_size);
-  client.println();
+  HTTPClient http;
   
-  uint8_t* p = (uint8_t*)record_buffer;
-  size_t left = record_size;
-  // Upload audio buffer in chunks to prevent memory overflow
-  while(left > 0) {
-      size_t chunk = (left > 1024) ? 1024 : left;
-      client.write(p, chunk);
-      p += chunk;
-      left -= chunk;
-  }
+  http.setTimeout(20000); // 必须给足时间传大文件
+  
+  String url = "https://vop.baidu.com/server_api?dev_pid=1537&cuid=ESP32&token=" + baidu_token;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "audio/pcm;rate=16000");
 
-  String response = "";
-  long start = millis();
-  while (millis() - start < 6000) {
-    delay(1); // 🛡️ Feed the watchdog to prevent crash/reboot
-    if (client.available()) {
-      String line = client.readStringUntil('\n');
-      if (line == "\r") { 
-        String body = client.readString();
-        JsonDocument doc;
-        deserializeJson(doc, body);
-        if (doc.containsKey("result")) return String((const char*)doc["result"][0]);
-        break;
+  int httpCode = http.POST((uint8_t*)record_buffer, record_size);
+  
+  if (httpCode == 200) {
+      String body = http.getString();
+      Serial.println("🔍 [百度返回]: " + body); 
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, body);
+      if (doc.containsKey("result")) {
+          http.end();
+          return doc["result"][0].as<String>();
       }
-    }
+  } else {
+      Serial.printf("❌ 百度识别请求失败，状态码: %d\n", httpCode);
   }
-  return "";
+  http.end();
+  return "没听清";
 }
 
-// 4. Request DeepSeek AI (LLM)
 String askAI(String text) {
-    Serial.println("🧠 Calling DeepSeek brain...");
-    WiFiClientSecure client;
-    client.setInsecure();
-    if (!client.connect("api.deepseek.com", 443)) return "Network connection failed";
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure(); 
 
-    JsonDocument doc;
+    HTTPClient http;
+    http.setTimeout(15000); 
+    
+    http.useHTTP10(true); 
+    
+    http.begin(secureClient, "https://api.deepseek.com/chat/completions");
+    
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(deepseek_key));
+
+    DynamicJsonDocument doc(2048);
     doc["model"] = "deepseek-chat";
     doc["stream"] = false;
-    JsonArray messages = doc["messages"].to<JsonArray>();
+    JsonArray messages = doc.createNestedArray("messages");
     
-    JsonObject sysMsg = messages.add<JsonObject>();
+    JsonObject sysMsg = messages.createNestedObject();
     sysMsg["role"] = "system";
-    // System Prompt: Instruct AI to answer briefly in Chinese
-    sysMsg["content"] = "You are a voice assistant. Please reply in short, conversational Chinese, keeping your response under 30 words."; 
+    sysMsg["content"] =  "你是一个傲娇的二次元天才少女。对于我的问题，你总是先冷嘲热讽一句再回答。说话结尾喜欢带'哼'或'笨蛋'。绝对禁止超过27个字!"; 
 
-    JsonObject userMsg = messages.add<JsonObject>();
+    JsonObject userMsg = messages.createNestedObject();
     userMsg["role"] = "user";
     userMsg["content"] = text;
 
     String requestBody;
     serializeJson(doc, requestBody);
-
-    client.println("POST /chat/completions HTTP/1.1");
-    client.println("Host: api.deepseek.com");
-    client.println("Authorization: Bearer " + String(deepseek_key));
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(requestBody.length());
-    client.println();
-    client.println(requestBody);
-
-    String body = "";
-    bool isBody = false;
-    while(client.connected() || client.available()) {
-        delay(1); // 🛡️ Feed the watchdog
-        if (client.available()) {
-            String line = client.readStringUntil('\n');
-            if(line == "\r") isBody = true;
-            else if(isBody) body += line;
-        }
-    }
     
-    int jsonStart = body.indexOf('{');
-    if(jsonStart >= 0) {
-        String json = body.substring(jsonStart);
-        JsonDocument res;
-        deserializeJson(res, json);
-        return res["choices"][0]["message"]["content"].as<String>();
-    }
-    return "AI thinking encountered an error";
-}
+    int httpCode = http.POST(requestBody);
 
-// ===================== Main Setup =====================
+    if (httpCode == 200) {
+        // 砍掉所有花里胡哨的手动截取代码，现在可以直接拿纯净包裹了！
+        String payload = http.getString();
+        
+        DynamicJsonDocument res(2048);
+        DeserializationError error = deserializeJson(res, payload);
+        if (error) {
+            Serial.println("❌ 解析失败，服务器原话: " + payload);
+            return "解析失败";
+        }
+
+        String reply = res["choices"][0]["message"]["content"].as<String>();
+        if (reply == "null") return "AI没说话";
+        return reply;
+    } else {
+        Serial.printf("❌ 请求失败，状态码: %d\n", httpCode);
+    }
+    return "网络异常";
+}
+// ===================== 底层音频雷达探测器 =====================
+void audio_info(const char *info){
+    Serial.print("📢 [喇叭底层状态]: "); Serial.println(info);
+}
+void audio_showstation(const char *info){
+    Serial.print("📻 [流媒体连接]: "); Serial.println(info);
+}
+void audio_showstreamtitle(const char *info){
+    Serial.print("🎵 [正在播放]: "); Serial.println(info);
+}
+// ==============================================================
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // 1. Connect to WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\n✅ WiFi connected successfully!");
-
-  // 2. Initialize Speaker Amplifier
-  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DOUT);
-  audio.setVolume(10); // 🛡️ Volume set to 10 to prevent power surge (Brownout)
-  audio.connecttohost("https://dict.youdao.com/dictvoice?audio=System+Ready&type=1");
-
-  // 3. Initialize Microphone
-  i2s_mic_init();
-
-  // 4. Get Baidu Auth Token
-  getBaiduToken();
-  
-  // 5. Allocate External PSRAM
   record_buffer = (char*)ps_malloc(MAX_RECORD_SIZE); 
   if (record_buffer == NULL) {
-      Serial.println("❌ Memory allocation failed! Ensure OPI PSRAM is enabled in Arduino Tools!");
-  } else {
-      Serial.println("✅ System ready! Hold the BOOT button to speak!");
+      Serial.println("⚠️ 警告：未检测到 PSRAM 或分配失败！强制降级...");
+      MAX_RECORD_SIZE = 1024 * 100; 
+      record_buffer = (char*)malloc(MAX_RECORD_SIZE);
+      if (record_buffer == NULL) {
+          Serial.println("❌ 致命错误：普通内存也分配失败！");
+          while (true) { delay(1000); }
+      }
   }
+
+  WiFi.begin(ssid, password);
+  Serial.print("\n正在连接 WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n✅ WiFi 连接成功!");
+
+  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DOUT);
+  audio.setVolume(100); 
+  audio.setConnectionTimeout(1000, 2000);
+
+  i2s_mic_init();
+  getBaiduToken();
+  
+  Serial.println("=================================================");
+  Serial.println("✅ 返璞归真版系统全部就绪！快按键录音吧！");
+  Serial.println("=================================================");
 }
 
-// ===================== Main Loop =====================
 void loop() {
-  audio.loop(); // Keep the audio player running continuously
+  audio.loop(); 
 
-  // Detect Button Press (BOOT button goes LOW when pressed)
   if (digitalRead(BUTTON_PIN) == LOW) {
     if (!is_recording) {
       is_recording = true;
       record_size = 0;
-      audio.stopSong(); // Mute speaker and prepare to listen
-      Serial.println("\n🎙️ [Recording Started] Please speak into the mic...");
+      audio.stopSong(); 
+      Serial.println("\n🎙️ [录音中...] 请说话！");
+      
+      // 过滤开头杂音
+      size_t dummy_bytes;
+      i2s_read(I2S_NUM_1, record_buffer, 2048, &dummy_bytes, 100); 
     }
     
-    // Continuously record audio data into the memory buffer
     if (record_size < MAX_RECORD_SIZE - 1024) {
-      size_t bytes_read;
-      // 🛡️ portMAX_DELAY ensures buffer fills completely, preventing frame drops
-      i2s_read(I2S_NUM_1, record_buffer + record_size, 1024, &bytes_read, portMAX_DELAY);
-      record_size += bytes_read;
+      size_t bytes_read = 0;
+      i2s_read(I2S_NUM_1, record_buffer + record_size, 1024, &bytes_read, 100);
+      if (bytes_read > 0) record_size += bytes_read;
     }
   } 
-  else { // Button Released
+  else { 
     if (is_recording) {
       is_recording = false;
-      Serial.println("⏹️ [Recording Ended]");
+      Serial.printf("\n⏹️ [录音结束]，录制了 %d 字节...\n", record_size);
 
-      if (record_size > 10000) { // Prevent accidental short clicks
-        // Step A: Send audio to Baidu STT
+      if (record_size > 8000) { 
+        Serial.println("\n[1/3] 上传百度识别...");
         String text = speechToText();
-        Serial.println("🗣️ Recognized Text: " + text);
+        Serial.println("🗣️ 识别结果: " + text);
 
-        if (text.length() > 0) {
-          // Step B: Send text to DeepSeek LLM
+        if (text != "没听清" && text != "" && text != "网络连接失败") {
+          Serial.println("\n[2/3] 呼叫 DeepSeek...");
           String reply = askAI(text);
-          Serial.println("🤖 AI Reply: " + reply);
+          Serial.println("🤖 AI 回复: " + reply);
 
-          // Step C: URL Encode and fetch TTS audio
-          String urlEncoded = "";
-          for (int i = 0; i < reply.length(); i++) {
-               if (isalnum(reply[i])) urlEncoded += reply[i];
-               // 🛡️ Cast to uint8_t to prevent negative value hex encoding issues
-               else urlEncoded += "%" + String((uint8_t)reply[i], HEX);
+          if (reply != "解析失败" && reply != "网络异常" && reply != "AI没说话") {
+            Serial.println("\n[3/3] 请求语音合成...");
+            String urlEncoded = "";
+            for (int i = 0; i < reply.length(); i++) {
+                 if (isalnum((unsigned char)reply[i])) {
+                     urlEncoded += reply[i];
+                 } else {
+                     String hex = String((uint8_t)reply[i], HEX);
+                     if (hex.length() < 2) hex = "0" + hex;
+                     urlEncoded += "%" + hex;
+                 }
+            }
+String tts = "http://tsn.baidu.com/text2audio?tex=" + urlEncoded + "&lan=zh&cuid=ESP32&ctp=1&tok=" + baidu_token + "&per=5";
+            audio.connecttohost(tts.c_str());
           }
-          String tts = "https://dict.youdao.com/dictvoice?audio=" + urlEncoded + "&type=1&le=zh";
-          audio.connecttohost(tts.c_str());
-        } else {
-          Serial.println("❌ Could not hear clearly.");
         }
+      } else {
+        Serial.println("❌ 录音太短，防误触机制已拦截。");
       }
     }
   }
 }
-
-// Required callback function for the ESP32-audioI2S library
-void audio_info(const char *info){ }
